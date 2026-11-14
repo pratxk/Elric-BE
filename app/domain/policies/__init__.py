@@ -69,3 +69,17 @@ def auto_approve_decision(
             f"amount ₹{amount_inr} exceeds auto-approve limit ₹{policy.max_amount_inr}",
         )
     return True, "clean match within auto-approve limit"
+
+
+def policy_from_settings(settings: dict | None) -> AutoApprovePolicy:
+    """Build the auto-approve policy from a user's settings snapshot
+    (graph state). Falls back to the env/config default limit when a
+    run carries no settings (eval, graph tests).
+
+    The matcher AND the approver gate MUST use this same function: in
+    v1.1 the matcher used the user's limit while the approver re-checked
+    with the default, so a ₹0-limit user hit an infinite
+    exception → approve → exception loop (the approver kept
+    "auto-approving" a match the matcher had refused)."""
+    limit = Decimal(str((settings or {}).get("auto_approve_limit_inr", "500000")))
+    return AutoApprovePolicy(max_amount_inr=limit)

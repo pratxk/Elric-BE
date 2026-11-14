@@ -41,9 +41,18 @@ def validate_tax(
     """Validate an invoice's tax. Returns a list of mismatch dicts (empty = OK).
 
     Each dict: {field, expected, actual, message}.
+
+    When any line's tax rate is unknown (None — e.g. a US invoice where
+    the model returned no per-line rate), GST cannot be recomputed from
+    lines, so validation is skipped entirely: a non-GST invoice must
+    never be flagged TAX_MISMATCH for missing Indian tax data. The
+    header-level totals are still checked by the extraction self-check
+    and the matcher's total rule.
     """
     mismatches: list[dict] = []
-    expected_tax = money_sum([ln.line_tax for ln in invoice.lines])
+    if not invoice.tax_rates_known:
+        return mismatches
+    expected_tax = money_sum([ln.line_tax for ln in invoice.lines])  # type: ignore[arg-type]
     if abs(to_money(invoice.tax_total) - expected_tax) > Decimal("1.00"):
         mismatches.append(
             {
@@ -56,7 +65,7 @@ def validate_tax(
     # Slab check per line.
     for idx, ln in enumerate(invoice.lines):
         expected_rate = slab_for_hsn(ln.hsn_code)
-        if ln.hsn_code and ln.tax_rate_pct != expected_rate:
+        if ln.hsn_code and ln.tax_rate_pct is not None and ln.tax_rate_pct != expected_rate:
             mismatches.append(
                 {
                     "field": f"lines[{idx}].tax_rate_pct",

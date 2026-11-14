@@ -1,11 +1,23 @@
 """FastAPI routers (§8). Thin: validate → service → respond.
 
+Auth (v1.1): every route on this router requires a valid access token
+(Bearer) — the router-level ``require_user`` dependency enforces it;
+``/health`` and the public auth endpoints live outside this router.
+Every read/write is scoped to the logged-in user: legacy rows with
+user_id NULL are invisible (never served), and cross-user access to a
+known id returns 404, not 403 (ids must not be enumerable).
+
 Upload runs the LangGraph pipeline in a BackgroundTask. The graph run is
 streamed (``stream_mode="updates"``) so every node event lands in the
 append-only audit log as it happens — the SSE trace endpoint then streams
 that stored trail, which is the live trace. A run that pauses at the
 approval interrupt is resumed by the approve/reject endpoints with a real
 ``Command(resume=...)``; the bookkeeper then posts to the ledger.
+
+The upload snapshots the owner's settings into graph state, so the
+matcher/auto-approve path uses the LOGGED-IN USER's limits and
+tolerances, falling back to env/config defaults only when a run carries
+no settings (eval, graph tests).
 
 When extraction is unavailable (no Gemini key) the graph parks the
 invoice on_hold — never faked.
@@ -16,15 +28,16 @@ from __future__ import annotations
 import json
 import statistics
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 
 from app.agents.ingestor import document_hash
 from app.agents.matcher import _row_to_invoice
+from app.api.auth import require_user
 from app.domain.lifecycle import transition
 from app.domain.models import (
     GoodsReceipt,
@@ -45,15 +58,20 @@ from .schemas import (
     DecisionIn,
     DiscountIn,
     EvalRunOut,
+    EvalSummaryOut,
     InvoiceOut,
     LedgerOut,
     MetricsOut,
     PaymentOut,
     PurchaseOrderIn,
+    SettingsIn,
+    SettingsOut,
+    VendorIn,
+    VendorOut,
     VendorQueryOut,
 )
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
 approval_service = ApprovalService()
 bookkeeping_service = BookkeepingService()
 
@@ -84,6 +102,32 @@ def _row_to_out(row) -> InvoiceOut:
         match=match,
         exceptions=row.exceptions(),
         payment_terms=row.payment_terms,
+        extraction_error=row.extraction_error,
+        extraction_error_kind=row.extraction_error_kind,
+    )
+
+
+def _settings_to_out(row) -> SettingsOut:
+    return SettingsOut(
+        company_name=row.company_name,
+        country=row.country,
+        state=row.state,
+        currency=row.currency,
+        auto_approve_limit_inr=row.auto_approve_limit_inr,
+        tolerance_pct=row.tolerance_pct,
+        tolerance_flat_inr=row.tolerance_flat_inr,
+        duplicate_window_days=row.duplicate_window_days,
+    )
+
+
+def _vendor_to_out(row) -> VendorOut:
+    return VendorOut(
+        id=row.id,
+        name=row.name,
+        gstin=row.gstin,
+        state=row.state,
+        payment_terms=row.payment_terms,
+        email=row.email,
     )
 
 
@@ -124,6 +168,16 @@ def _sync_state_to_store(invoice_id: str, state: dict) -> None:
         fields["match"] = state["match"]
     if state.get("exceptions") is not None:
         fields["exceptions"] = state["exceptions"]
+    # Extraction failure is persisted on the row (never left in graph
+    # state only) so the API can surface the TRUE reason. A successful
+    # extraction clears a previous failure — a retry must not leave a
+    # stale "overloaded" on a now-extracted invoice.
+    if state.get("extraction_error"):
+        fields["extraction_error"] = state["extraction_error"]
+        fields["extraction_error_kind"] = state.get("extraction_error_kind") or "failed"
+    elif state.get("extracted"):
+        fields["extraction_error"] = None
+        fields["extraction_error_kind"] = None
     store.update_invoice(invoice_id, **fields)
     if state.get("auto_approved"):
         store.record_audit(
@@ -176,14 +230,23 @@ def _stream_graph(invoice_id: str, payload) -> tuple[dict, bool]:
     return state, paused
 
 
-def _run_graph(invoice_id: str, doc_hash: str) -> None:
-    """Background graph run for an uploaded invoice."""
+def _run_graph(
+    invoice_id: str,
+    doc_hash: str,
+    user_id: str | None = None,
+    settings: dict | None = None,
+) -> None:
+    """Background graph run for an uploaded invoice. The owner's id and
+    settings snapshot travel in state so every node (matcher, extractor,
+    bookkeeper) works on that user's data and limits."""
     try:
         state, paused = _stream_graph(
             invoice_id,
             {
                 "invoice_id": invoice_id,
                 "document_hash": doc_hash,
+                "user_id": user_id,
+                "settings": settings,
                 "audit": [],
             },
         )
@@ -194,10 +257,20 @@ def _run_graph(invoice_id: str, doc_hash: str) -> None:
             # parked it, or the state sync found no status): flag it so a
             # human sees it instead of it sitting as "received" forever.
             store.update_invoice(invoice_id, status="flagged")
-    except Exception:  # noqa: BLE001 — park the invoice, don't crash
+    except Exception as exc:  # noqa: BLE001 — park the invoice, don't crash
         row = store.get_invoice(invoice_id)
         if row is not None and row.status == "received":
-            store.update_invoice(invoice_id, status="flagged")
+            # The graph itself failed (not just extraction): persist the
+            # reason on the row so the UI can show it and offer a retry
+            # instead of a silent "received" that never moves.
+            from app.agents.extractor import _safe_message
+
+            store.update_invoice(
+                invoice_id,
+                status="flagged",
+                extraction_error=f"Pipeline failed: {_safe_message(str(exc))}",
+                extraction_error_kind="failed",
+            )
     finally:
         row = store.get_invoice(invoice_id)
         if row is not None:
@@ -223,12 +296,84 @@ def _invoice_from_row(row) -> object | None:
     return _row_to_invoice(row)
 
 
+def _owned_invoice(invoice_id: str, user: dict):
+    """The user's invoice row, or 404 (also for another user's id and
+    for legacy NULL rows — ids are not enumerable)."""
+    row = store.get_invoice(invoice_id, user_id=user["id"])
+    if row is None:
+        raise HTTPException(status_code=404, detail="invoice not found")
+    return row
+
+
+# -- settings (v1.1) --------------------------------------------------------
+
+
+@router.get("/settings", response_model=SettingsOut)
+def get_settings(user: dict = Depends(require_user)):
+    return _settings_to_out(store.get_or_create_settings(user["id"]))
+
+
+@router.put("/settings", response_model=SettingsOut)
+def update_settings(body: SettingsIn, user: dict = Depends(require_user)):
+    row = store.update_settings(user["id"], body.model_dump())
+    return _settings_to_out(row)
+
+
+# -- vendors: registry CRUD (v1.1) + open-balance summary -------------------
+# NOTE: GET /api/vendors keeps its v1 meaning — per-vendor open AP
+# position derived from the user's own invoices. The registry itself is
+# managed via POST /api/vendors and GET/PUT/DELETE /api/vendors/{id}.
+# GET /api/vendors/registry lists the registry itself (per user): the
+# Vendors page merges it with the summaries so a vendor added in
+# onboarding shows up even before its first invoice. It MUST be
+# registered before /vendors/{vendor_id} — FastAPI matches routes in
+# order, and the path-param route would swallow "registry" as an id.
+
+
+@router.get("/vendors/registry", response_model=list[VendorOut])
+def list_vendors_registry(user: dict = Depends(require_user)):
+    return [_vendor_to_out(r) for r in store.list_vendors(user["id"])]
+
+
+@router.post("/vendors", response_model=VendorOut, status_code=201)
+def create_vendor(body: VendorIn, user: dict = Depends(require_user)):
+    row = store.create_vendor(user["id"], body.model_dump())
+    return _vendor_to_out(row)
+
+
+@router.get("/vendors/{vendor_id}", response_model=VendorOut)
+def get_vendor(vendor_id: str, user: dict = Depends(require_user)):
+    row = store.get_vendor(vendor_id, user_id=user["id"])
+    if row is None:
+        raise HTTPException(status_code=404, detail="vendor not found")
+    return _vendor_to_out(row)
+
+
+@router.put("/vendors/{vendor_id}", response_model=VendorOut)
+def update_vendor(
+    vendor_id: str, body: VendorIn, user: dict = Depends(require_user)
+):
+    row = store.update_vendor(vendor_id, user["id"], body.model_dump())
+    if row is None:
+        raise HTTPException(status_code=404, detail="vendor not found")
+    return _vendor_to_out(row)
+
+
+@router.delete("/vendors/{vendor_id}", status_code=204)
+def delete_vendor(vendor_id: str, user: dict = Depends(require_user)):
+    if not store.delete_vendor(vendor_id, user["id"]):
+        raise HTTPException(status_code=404, detail="vendor not found")
+    return Response(status_code=204)
+
+
 # -- invoices -------------------------------------------------------------
 
 
 @router.post("/invoices/upload", response_model=InvoiceOut, status_code=202)
 async def upload_invoice(
-    background_tasks: BackgroundTasks, file: UploadFile = File(...)
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user: dict = Depends(require_user),
 ):
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -240,8 +385,8 @@ async def upload_invoice(
         raise HTTPException(status_code=413, detail="file exceeds 20 MB")
     doc_hash = document_hash(content)
 
-    # Hash dedupe before any LLM call (§19a.1).
-    for row in store.list_invoices():
+    # Hash dedupe before any LLM call (§19a.1), scoped to this user.
+    for row in store.list_invoices(user_id=user["id"]):
         if row.document_hash == doc_hash:
             raise HTTPException(
                 status_code=409,
@@ -253,6 +398,7 @@ async def upload_invoice(
     row = store.create_invoice(
         {
             "id": invoice_id,
+            "user_id": user["id"],
             "invoice_number": file.filename or "unknown",
             "invoice_date": "",
             "status": InvoiceStatus.RECEIVED.value,
@@ -260,39 +406,91 @@ async def upload_invoice(
         }
     )
     store.record_audit(
-        "upload", actor="system", invoice_id=invoice_id, filename=file.filename
+        "upload", actor="system", invoice_id=invoice_id,
+        user_id=user["id"], filename=file.filename,
     )
-    background_tasks.add_task(_run_graph, invoice_id, doc_hash)
+    background_tasks.add_task(
+        _run_graph,
+        invoice_id,
+        doc_hash,
+        user["id"],
+        store.settings_dict(user["id"]),
+    )
     return _row_to_out(row)
 
 
 @router.get("/invoices", response_model=list[InvoiceOut])
-def list_invoices(status: str | None = None):
-    return [_row_to_out(r) for r in store.list_invoices(status=status)]
+def list_invoices(status: str | None = None, user: dict = Depends(require_user)):
+    return [
+        _row_to_out(r)
+        for r in store.list_invoices(status=status, user_id=user["id"])
+    ]
 
 
 @router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
-def get_invoice(invoice_id: str):
-    row = store.get_invoice(invoice_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
-    return _row_to_out(row)
+def get_invoice(invoice_id: str, user: dict = Depends(require_user)):
+    return _row_to_out(_owned_invoice(invoice_id, user))
+
+
+@router.post("/invoices/{invoice_id}/retry-extraction", response_model=InvoiceOut, status_code=202)
+def retry_extraction(
+    invoice_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_user),
+):
+    """Re-run the pipeline for an invoice whose extraction failed
+    (on_hold / flagged). The document bytes must still be in the
+    in-process registry — after a server restart they are gone and the
+    user must re-upload (422, said plainly). The previous failure is
+    cleared before the re-run so a retry never shows a stale error."""
+    row = _owned_invoice(invoice_id, user)
+    if row.status not in ("on_hold", "flagged"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"only on-hold or flagged invoices can be retried "
+            f"(this one is {row.status})",
+        )
+    if docstore.get(invoice_id) is None:
+        raise HTTPException(
+            status_code=422,
+            detail="the original document is no longer on this server "
+            "(it was lost when the server restarted) — please re-upload "
+            "the invoice",
+        )
+    store.update_invoice(
+        invoice_id,
+        status="received",
+        extraction_error=None,
+        extraction_error_kind=None,
+    )
+    store.record_audit(
+        "retry_extraction", actor="system", invoice_id=invoice_id,
+        user_id=user["id"],
+    )
+    background_tasks.add_task(
+        _run_graph,
+        invoice_id,
+        row.document_hash or "",
+        user["id"],
+        store.settings_dict(user["id"]),
+    )
+    return _row_to_out(store.get_invoice(invoice_id, user_id=user["id"]))
 
 
 @router.post("/invoices/{invoice_id}/approve", response_model=InvoiceOut)
-def approve_invoice(invoice_id: str, body: DecisionIn):
-    row = store.get_invoice(invoice_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
+def approve_invoice(
+    invoice_id: str, body: DecisionIn, user: dict = Depends(require_user)
+):
+    row = _owned_invoice(invoice_id, user)
     # Real HITL resume: if a graph run is paused at the approval
     # interrupt, the decision resumes it and the bookkeeper posts.
     if _graph_paused(invoice_id):
         _resume_graph(invoice_id, "approved")
         store.record_audit(
             "approve", actor=body.approver, invoice_id=invoice_id,
-            reason=body.reason,
+            user_id=user["id"], reason=body.reason,
         )
-        return _row_to_out(store.get_invoice(invoice_id))
+        return _row_to_out(store.get_invoice(invoice_id, user_id=user["id"]))
     # No paused run (e.g. already matched, or a direct approval): apply
     # the lifecycle transition and post via the bookkeeper service.
     try:
@@ -301,48 +499,48 @@ def approve_invoice(invoice_id: str, body: DecisionIn):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     store.update_invoice(invoice_id, status=new_status.value)
     store.record_audit(
-        "approve", actor=body.approver, invoice_id=invoice_id, reason=body.reason
+        "approve", actor=body.approver, invoice_id=invoice_id,
+        user_id=user["id"], reason=body.reason,
     )
     invoice = _invoice_from_row(store.get_invoice(invoice_id))
     if invoice is not None:
-        bookkeeping_service.post_invoice(invoice, store=store)
+        bookkeeping_service.post_invoice(invoice, store=store, user_id=user["id"])
         store.update_invoice(invoice_id, status=InvoiceStatus.POSTED.value)
         store.record_audit(
             "booked", actor="system", invoice_id=invoice_id,
-            status=InvoiceStatus.POSTED.value,
+            user_id=user["id"], status=InvoiceStatus.POSTED.value,
         )
-    return _row_to_out(store.get_invoice(invoice_id))
+    return _row_to_out(store.get_invoice(invoice_id, user_id=user["id"]))
 
 
 @router.post("/invoices/{invoice_id}/reject", response_model=InvoiceOut)
-def reject_invoice(invoice_id: str, body: DecisionIn):
-    row = store.get_invoice(invoice_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
+def reject_invoice(
+    invoice_id: str, body: DecisionIn, user: dict = Depends(require_user)
+):
+    row = _owned_invoice(invoice_id, user)
     if _graph_paused(invoice_id):
         _resume_graph(invoice_id, "rejected")
         store.record_audit(
             "reject", actor=body.approver, invoice_id=invoice_id,
-            reason=body.reason,
+            user_id=user["id"], reason=body.reason,
         )
-        return _row_to_out(store.get_invoice(invoice_id))
+        return _row_to_out(store.get_invoice(invoice_id, user_id=user["id"]))
     try:
         new_status = transition(InvoiceStatus(row.status), "reject")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     store.update_invoice(invoice_id, status=new_status.value)
     store.record_audit(
-        "reject", actor=body.approver, invoice_id=invoice_id, reason=body.reason
+        "reject", actor=body.approver, invoice_id=invoice_id,
+        user_id=user["id"], reason=body.reason,
     )
-    return _row_to_out(store.get_invoice(invoice_id))
+    return _row_to_out(store.get_invoice(invoice_id, user_id=user["id"]))
 
 
 @router.post("/invoices/{invoice_id}/query-vendor", response_model=VendorQueryOut)
-def query_vendor(invoice_id: str):
+def query_vendor(invoice_id: str, user: dict = Depends(require_user)):
     """Draft only — returns a vendor query draft, never sends it."""
-    row = store.get_invoice(invoice_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
+    row = _owned_invoice(invoice_id, user)
     invoice = _invoice_from_row(row)
     causes = [
         {
@@ -377,19 +575,18 @@ def query_vendor(invoice_id: str):
         ]
         draft = "\n".join(lines)
     store.record_audit(
-        "vendor_query_drafted", actor="system", invoice_id=invoice_id
+        "vendor_query_drafted", actor="system", invoice_id=invoice_id,
+        user_id=user["id"],
     )
     return VendorQueryOut(invoice_id=invoice_id, draft=draft, sent=False)
 
 
 @router.get("/invoices/{invoice_id}/trace")
-def invoice_trace(invoice_id: str):
+def invoice_trace(invoice_id: str, user: dict = Depends(require_user)):
     """SSE: streams the stored audit trail for the invoice (including the
     per-node events recorded live during the graph run), then a done
     event. Same pattern as Almighty's /api/chat/stream."""
-    row = store.get_invoice(invoice_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
+    row = _owned_invoice(invoice_id, user)
 
     def events():
         for entry in store.audit_for_invoice(invoice_id):
@@ -409,9 +606,8 @@ def invoice_trace(invoice_id: str):
 
 
 @router.get("/invoices/{invoice_id}/ledger", response_model=list[LedgerOut])
-def invoice_ledger(invoice_id: str):
-    if store.get_invoice(invoice_id) is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
+def invoice_ledger(invoice_id: str, user: dict = Depends(require_user)):
+    _owned_invoice(invoice_id, user)
     return [
         LedgerOut(
             id=r.id,
@@ -426,9 +622,8 @@ def invoice_ledger(invoice_id: str):
 
 
 @router.get("/invoices/{invoice_id}/payments", response_model=list[PaymentOut])
-def invoice_payments(invoice_id: str):
-    if store.get_invoice(invoice_id) is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
+def invoice_payments(invoice_id: str, user: dict = Depends(require_user)):
+    _owned_invoice(invoice_id, user)
     return [
         PaymentOut(
             id=r.id,
@@ -445,10 +640,11 @@ def invoice_payments(invoice_id: str):
 
 
 @router.post("/purchase-orders", status_code=201)
-def create_purchase_order(po: PurchaseOrderIn):
+def create_purchase_order(po: PurchaseOrderIn, user: dict = Depends(require_user)):
     row = store.create_po(
         {
             "id": str(uuid.uuid4()),
+            "user_id": user["id"],
             "po_number": po.po_number,
             "vendor_id": po.vendor_id,
             "vendor_name": po.vendor_name,
@@ -468,7 +664,9 @@ def create_purchase_order(po: PurchaseOrderIn):
 
 
 @router.get("/purchase-orders")
-def list_purchase_orders(vendor_id: str | None = None):
+def list_purchase_orders(
+    vendor_id: str | None = None, user: dict = Depends(require_user)
+):
     return [
         {
             "id": r.id,
@@ -479,16 +677,17 @@ def list_purchase_orders(vendor_id: str | None = None):
             "total": str(r.total),
             "lines": r.lines(),
         }
-        for r in store.list_pos(vendor_id=vendor_id)
+        for r in store.list_pos(vendor_id=vendor_id, user_id=user["id"])
     ]
 
 
 @router.post("/goods-receipts", status_code=201)
-def create_goods_receipt(gr: GoodsReceipt):
+def create_goods_receipt(gr: GoodsReceipt, user: dict = Depends(require_user)):
     row = store.create_gr(
         {
             "id": gr.id,
             "gr_number": gr.gr_number,
+            "user_id": user["id"],
             "po_id": gr.po_id,
             "receipt_date": gr.receipt_date,
             "lines": [ln.model_dump(mode="json") for ln in gr.lines],
@@ -504,12 +703,14 @@ def create_goods_receipt(gr: GoodsReceipt):
 
 
 @router.get("/goods-receipts")
-def list_goods_receipts(po_id: str | None = None):
+def list_goods_receipts(
+    po_id: str | None = None, user: dict = Depends(require_user)
+):
     if po_id:
-        row = store.get_gr_by_po(po_id)
+        row = store.get_gr_by_po(po_id, user_id=user["id"])
         rows = [row] if row is not None else []
     else:
-        rows = store.list_grs()
+        rows = store.list_grs(user_id=user["id"])
     return [
         {
             "id": r.id,
@@ -526,7 +727,7 @@ def list_goods_receipts(po_id: str | None = None):
 
 
 @router.get("/ledger", response_model=list[LedgerOut])
-def list_ledger():
+def list_ledger(user: dict = Depends(require_user)):
     return [
         LedgerOut(
             id=r.id,
@@ -536,12 +737,12 @@ def list_ledger():
             credit=r.credit,
             posted_at=r.posted_at.isoformat(),
         )
-        for r in store.list_ledger()
+        for r in store.list_ledger(user_id=user["id"])
     ]
 
 
 @router.get("/payments", response_model=list[PaymentOut])
-def list_payments():
+def list_payments(user: dict = Depends(require_user)):
     return [
         PaymentOut(
             id=r.id,
@@ -550,7 +751,7 @@ def list_payments():
             scheduled_date=r.scheduled_date,
             status=r.status,
         )
-        for r in store.list_payments()
+        for r in store.list_payments(user_id=user["id"])
     ]
 
 
@@ -558,16 +759,22 @@ def list_payments():
 
 
 @router.get("/queue/exceptions", response_model=list[InvoiceOut])
-def exception_queue():
-    flagged = store.list_invoices(status=InvoiceStatus.FLAGGED.value)
-    on_hold = store.list_invoices(status=InvoiceStatus.ON_HOLD.value)
+def exception_queue(user: dict = Depends(require_user)):
+    flagged = store.list_invoices(
+        status=InvoiceStatus.FLAGGED.value, user_id=user["id"]
+    )
+    on_hold = store.list_invoices(
+        status=InvoiceStatus.ON_HOLD.value, user_id=user["id"]
+    )
     return [_row_to_out(r) for r in flagged + on_hold]
 
 
 @router.get("/aging", response_model=AgingOut)
-def aging(as_of: str | None = None):
+def aging(as_of: str | None = None, user: dict = Depends(require_user)):
     as_of_date = date.fromisoformat(as_of) if as_of else date.today()
-    result = compute_aging(store.list_invoices(), as_of=as_of_date)
+    result = compute_aging(
+        store.list_invoices(user_id=user["id"]), as_of=as_of_date
+    )
     return AgingOut(
         as_of=result["as_of"],
         buckets=result["buckets"],
@@ -578,8 +785,9 @@ def aging(as_of: str | None = None):
 
 
 @router.get("/vendors")
-def vendor_summaries():
-    """Per-vendor open AP position, derived from stored invoices.
+def vendor_summaries(user: dict = Depends(require_user)):
+    """Per-vendor open AP position, derived from the USER's stored
+    invoices only — never seeded, never another user's.
 
     Open balance = open (unpaid) invoice totals per vendor; open count
     and last invoice date likewise. Reliability / on-time scores are
@@ -590,7 +798,7 @@ def vendor_summaries():
         "approved", "posted", "scheduled", "on_hold",
     }
     by_vendor: dict[str, dict] = {}
-    for row in store.list_invoices():
+    for row in store.list_invoices(user_id=user["id"]):
         if row.status not in open_statuses:
             continue
         # Rows with no vendor at all (e.g. an upload that never
@@ -625,8 +833,8 @@ def vendor_summaries():
 
 
 @router.get("/metrics", response_model=MetricsOut)
-def metrics():
-    rows = store.list_invoices()
+def metrics(user: dict = Depends(require_user)):
+    rows = store.list_invoices(user_id=user["id"])
     by_status: dict[str, int] = {}
     money_in_exceptions = Decimal("0.00")
     matched_clean = 0
@@ -681,9 +889,15 @@ def forecast(
     weeks: int = 4,
     weekly_budget_inr: Decimal | None = None,
     cost_of_capital_pct: Decimal = Decimal("12"),
+    user: dict = Depends(require_user),
 ):
     invoices = [
-        inv for inv in (_row_to_invoice(r) for r in store.list_invoices()) if inv
+        inv
+        for inv in (
+            _row_to_invoice(r)
+            for r in store.list_invoices(user_id=user["id"])
+        )
+        if inv
     ]
     service = ForecastService(cost_of_capital_annual_pct=cost_of_capital_pct)
     return service.forecast(
@@ -692,10 +906,8 @@ def forecast(
 
 
 @router.post("/forecast/discount")
-def forecast_discount(body: DiscountIn):
-    row = store.get_invoice(body.invoice_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
+def forecast_discount(body: DiscountIn, user: dict = Depends(require_user)):
+    row = _owned_invoice(body.invoice_id, user)
     invoice = _row_to_invoice(row)
     if invoice is None:
         raise HTTPException(status_code=422, detail="stored invoice is malformed")
@@ -718,3 +930,35 @@ def run_eval(n_per_scenario: int = 2, include_graph: bool = True):
         graph_result = run_graph_eval(n_per_scenario=n_per_scenario)
         store.save_eval_run("graph", graph_result)
     return EvalRunOut(kind="synthetic", metrics=result, graph_eval=graph_result)
+
+
+@router.get("/eval/summary", response_model=EvalSummaryOut)
+def eval_summary(refresh: bool = False):
+    """Eval scores for the frontend Eval page (system-level data — the
+    synthetic corpus is not per-user, so no user filtering applies).
+
+    Cached run: when stored synthetic AND graph runs exist, return them
+    with cached=true. Otherwise run both evals now (n_per_scenario=2,
+    seed=42), save them, and return cached=false. ?refresh=true forces
+    a re-run. Zero LLM calls either way."""
+    if not refresh:
+        syn = store.latest_eval_run("synthetic")
+        gra = store.latest_eval_run("graph")
+        if syn is not None and gra is not None:
+            generated_at = max(syn.created_at, gra.created_at).isoformat()
+            return EvalSummaryOut(
+                synthetic=json.loads(syn.metrics_json),
+                graph=json.loads(gra.metrics_json),
+                generated_at=generated_at,
+                cached=True,
+            )
+    syn_result = run_synthetic_eval(n_per_scenario=2, seed=42)
+    store.save_eval_run("synthetic", syn_result)
+    graph_result = run_graph_eval(n_per_scenario=2, seed=42)
+    store.save_eval_run("graph", graph_result)
+    return EvalSummaryOut(
+        synthetic=syn_result,
+        graph=graph_result,
+        generated_at=datetime.utcnow().isoformat(),
+        cached=False,
+    )

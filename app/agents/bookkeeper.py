@@ -36,6 +36,7 @@ def bookkeeper_node(state: InvoiceState) -> dict:
             invoice,
             payment_terms=state.get("payment_terms") or invoice.payment_terms,
             store=persist_store,
+            user_id=state.get("user_id"),
         )
     except Exception as exc:  # noqa: BLE001 — never crash the graph on posting
         return {

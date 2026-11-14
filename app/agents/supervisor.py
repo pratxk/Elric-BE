@@ -32,4 +32,9 @@ def route_after_approval(state: InvoiceState) -> str:
         return "book"
     if decision == "rejected":
         return "done"
+    if state.get("auto_approved"):
+        # The approver gate auto-approved (defence-in-depth re-check):
+        # book it. Returning "exception" here would loop forever, since
+        # the approver would keep re-approving the same clean match.
+        return "book"
     return "exception"

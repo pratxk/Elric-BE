@@ -58,9 +58,15 @@ def is_already_paid(invoice: Invoice, paid_invoices: list[Invoice]) -> Invoice |
 
 
 def check_duplicate(
-    invoice: Invoice, existing: list[Invoice], paid: list[Invoice] | None = None
+    invoice: Invoice,
+    existing: list[Invoice],
+    paid: list[Invoice] | None = None,
+    window_days: int = NEAR_DUPLICATE_WINDOW_DAYS,
 ) -> tuple[str | None, Invoice | None]:
-    """Returns (kind, matched_invoice): kind in {"exact", "near", "paid"}."""
+    """Returns (kind, matched_invoice): kind in {"exact", "near", "paid"}.
+
+    ``window_days`` is the near-duplicate date window (per-user setting
+    in v1.1; default 90 days per §5)."""
     hit = is_exact_duplicate(invoice, existing)
     if hit:
         return "exact", hit
@@ -68,7 +74,7 @@ def check_duplicate(
         hit = is_already_paid(invoice, paid)
         if hit:
             return "paid", hit
-    hit = is_near_duplicate(invoice, existing)
+    hit = is_near_duplicate(invoice, existing, window_days=window_days)
     if hit:
         return "near", hit
     return None, None

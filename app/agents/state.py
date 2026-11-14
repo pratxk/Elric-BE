@@ -9,10 +9,20 @@ from typing import Annotated, Any, TypedDict
 class InvoiceState(TypedDict, total=False):
     invoice_id: str
     document_hash: str | None
+    user_id: str | None  # v1.1: owner of the invoice; scopes all lookups
+    # v1.1: the owner's settings snapshot at upload time, so the
+    # pipeline uses the LOGGED-IN USER's limits/tolerances, not env
+    # defaults: {auto_approve_limit_inr, tolerance_pct,
+    # tolerance_flat_inr, duplicate_window_days, ...}
+    settings: dict[str, Any] | None
     vendor_name: str | None
     invoice_number: str | None
     extracted: dict[str, Any] | None  # extracted fields + confidences
     extraction_error: str | None
+    # Machine-readable failure kind: "no_key" | "overloaded" | "quota" |
+    # "failed". The UI keys its copy on this — "no_key" only when the
+    # backend genuinely has no key configured.
+    extraction_error_kind: str | None
     match: dict[str, Any] | None  # serialized Match
     exceptions: list[dict]
     status: str

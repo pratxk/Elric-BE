@@ -65,7 +65,11 @@ class InvoiceLine(_Frozen):
     hsn_code: str | None = None
     qty: Decimal
     unit_price: Decimal
-    tax_rate_pct: Decimal = Decimal("18")
+    # No default rate: a missing per-line rate means "unknown" (None),
+    # NEVER 18%. Defaulting to Indian GST broke the arithmetic self-check
+    # on every non-GST invoice (eval 2026-11-15: 3 of 4 US invoices).
+    # Callers that need tax must check for None and skip that leg.
+    tax_rate_pct: Decimal | None = None
 
     @property
     def line_subtotal(self) -> Decimal:
@@ -74,9 +78,12 @@ class InvoiceLine(_Frozen):
         return to_money(self.qty * self.unit_price)
 
     @property
-    def line_tax(self) -> Decimal:
+    def line_tax(self) -> Decimal | None:
+        """Line tax, or None when the rate is unknown (no guessing)."""
         from app.domain.money import tax_amount
 
+        if self.tax_rate_pct is None:
+            return None
         return tax_amount(self.line_subtotal, self.tax_rate_pct)
 
 
@@ -100,14 +107,29 @@ class Invoice(BaseModel):
     payment_terms: str | None = None  # e.g. "2/10 Net 30" — discount optimizer
 
     def recompute_totals(self) -> "Invoice":
-        """Recompute subtotal/tax/total from lines. Returns a new instance."""
+        """Recompute subtotal/tax/total from lines. Returns a new instance.
+
+        Tax is only recomputed when EVERY line carries a rate. When any
+        rate is unknown, the stated tax_total is carried through and the
+        total is subtotal + stated tax — the tax leg cannot be verified
+        from lines, so it must not be invented (see the 18% default bug).
+        """
         from app.domain.money import money_sum
 
         subtotal = money_sum([ln.line_subtotal for ln in self.lines])
-        tax = money_sum([ln.line_tax for ln in self.lines])
+        line_taxes = [ln.line_tax for ln in self.lines]
+        if all(t is not None for t in line_taxes):
+            tax = money_sum(line_taxes)  # type: ignore[arg-type]
+        else:
+            tax = self.tax_total
         return self.model_copy(
             update={"subtotal": subtotal, "tax_total": tax, "total": subtotal + tax}
         )
+
+    @property
+    def tax_rates_known(self) -> bool:
+        """True when every line carries an explicit tax rate."""
+        return all(ln.tax_rate_pct is not None for ln in self.lines)
 
 
 class POLine(_Frozen):
@@ -115,7 +137,9 @@ class POLine(_Frozen):
     hsn_code: str | None = None
     qty: Decimal
     unit_price: Decimal
-    tax_rate_pct: Decimal = Decimal("18")
+    # Same rule as InvoiceLine: no 18% default. PO lines do not drive
+    # tax math, but a missing rate must stay unknown, not become GST.
+    tax_rate_pct: Decimal | None = None
 
 
 class PurchaseOrder(_Frozen):

@@ -42,6 +42,7 @@ class MatchingService:
         paid_invoices: list[Invoice] | None = None,
         buyer_state_code: str | None = None,
         seller_state_code: str | None = None,
+        duplicate_window_days: int = 90,
     ) -> Match:
         existing = existing_invoices or []
         rules: list[RuleOutcome] = []
@@ -49,7 +50,9 @@ class MatchingService:
 
         # 1. Duplicate check — before any LLM call in the real pipeline,
         #    and first here: a duplicate never auto-approves.
-        dup_kind, dup_of = duplicate.check_duplicate(invoice, existing, paid_invoices)
+        dup_kind, dup_of = duplicate.check_duplicate(
+            invoice, existing, paid_invoices, window_days=duplicate_window_days
+        )
         if dup_kind:
             rules.append(
                 RuleOutcome(
@@ -157,9 +160,34 @@ class MatchingService:
             else:
                 rules.append(RuleOutcome(rule="receipt_qty", passed=True))
 
-        # 5. Totals recomputed from lines.
+        # 5. Totals recomputed from lines. The subtotal leg always runs
+        # (pure line arithmetic). The total leg depends on recomputed
+        # line tax, so when any line's rate is unknown it is skipped —
+        # same rule as the extraction self-check: a correct invoice
+        # must not be flagged over a rate the document never stated
+        # (and a total can legitimately carry unmodeled charges such
+        # as shipping). When rates are known, the full check applies.
         recomputed = invoice.recompute_totals()
-        if to_money(recomputed.total) != to_money(invoice.total):
+        if to_money(recomputed.subtotal) != to_money(invoice.subtotal):
+            codes.add(ExceptionCode.TOTAL_MISMATCH)
+            rules.append(
+                RuleOutcome(
+                    rule="total_recompute",
+                    passed=False,
+                    detail=f"stated subtotal {invoice.subtotal} != "
+                    f"sum(lines) {recomputed.subtotal}",
+                )
+            )
+        elif not invoice.tax_rates_known:
+            rules.append(
+                RuleOutcome(
+                    rule="total_recompute",
+                    passed=True,
+                    detail="line tax rates unknown — total not "
+                    "recomputable from lines; subtotal verified",
+                )
+            )
+        elif to_money(recomputed.total) != to_money(invoice.total):
             codes.add(ExceptionCode.TOTAL_MISMATCH)
             rules.append(
                 RuleOutcome(

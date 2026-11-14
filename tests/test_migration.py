@@ -51,6 +51,15 @@ def test_migrate_adds_missing_columns_to_old_db(tmp_path):
     added = db_mod.migrate(engine)
     assert "invoices.payment_terms" in added
     assert "invoices.extraction_json" in added
+    # v1.1 fix round: the extraction failure is persisted on the row so
+    # the API can surface the true reason (503 overload, quota, no key).
+    assert "invoices.extraction_error" in added
+    assert "invoices.extraction_error_kind" in added
+    # v1.1 per-user scoping column lands on old DBs too. The other
+    # user_id columns belong to tables this fixture DB predates
+    # (purchase_orders etc. don't exist here) — migrate skips missing
+    # tables by design; create_all owns table creation.
+    assert "invoices.user_id" in added
     cols = _columns(engine)
     assert "payment_terms" in cols and "extraction_json" in cols
     # Idempotent: a second run adds nothing.

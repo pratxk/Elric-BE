@@ -8,15 +8,25 @@ forecast, ledger/payments endpoints and the graph-backed eval run.
 
 import io
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.agents import extractor as extractor_mod
 from app.eval.synthetic import generate_corpus
 from app.main import app
 from app.services.extraction_service import ExtractionService
+from tests.helpers import make_client
 from tests.test_extraction import FakeClient, _perfect_payload
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _authed_client():
+    """Every test runs as a freshly registered user (see test_api.py)."""
+    global client
+    client = make_client()
+    yield
 
 
 def _case(scenario):

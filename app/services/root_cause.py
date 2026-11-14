@@ -189,9 +189,10 @@ def _evidence_block(
         f"IGST=₹{invoice.igst}",
     ]
     for idx, ln in enumerate(invoice.lines):
+        rate = f"{ln.tax_rate_pct}%" if ln.tax_rate_pct is not None else "n/a"
         parts.append(
             f"  line {idx}: {ln.description} qty={ln.qty} "
-            f"unit_price=₹{ln.unit_price} tax_rate={ln.tax_rate_pct}%"
+            f"unit_price=₹{ln.unit_price} tax_rate={rate}"
         )
     if match is not None:
         parts.append(f"Match outcome={match.outcome.value} po_id={match.po_id}")

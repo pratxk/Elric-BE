@@ -14,20 +14,25 @@ from langgraph.types import interrupt
 
 from app.agents.state import InvoiceState
 from app.domain.models import Match
-from app.domain.policies import auto_approve_decision
+from app.domain.policies import auto_approve_decision, policy_from_settings
 
 
 def approver_node(state: InvoiceState) -> dict:
     match_data = state.get("match") or {}
     match = Match.model_validate(match_data) if match_data else None
-    # Re-check the policy at the gate (defence in depth).
+    # Re-check the policy at the gate (defence in depth) — with the
+    # SAME per-user policy the matcher used (state["settings"]). Using
+    # the default here while the matcher used a user limit looped the
+    # graph forever (see policy_from_settings).
     if match is not None:
         total = Decimal(str((state.get("extracted") or {}).get("total", "0")))
         if not total:
             extracted = state.get("extracted") or {}
             inv = extracted.get("invoice") or {}
             total = Decimal(str(inv.get("total", "0")))
-        approved, reason = auto_approve_decision(match, total)
+        approved, reason = auto_approve_decision(
+            match, total, policy_from_settings(state.get("settings"))
+        )
         if approved:
             return {
                 "auto_approved": True,

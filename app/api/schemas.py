@@ -5,7 +5,116 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.services import auth_service as _auth
+
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    onboarding_completed: bool = False
+
+
+class RegisterIn(BaseModel):
+    email: str
+    password: str
+
+    @field_validator("email")
+    @classmethod
+    def _valid_email(cls, v: str) -> str:
+        return _auth.validate_email(v)
+
+    @field_validator("password")
+    @classmethod
+    def _strong_password(cls, v: str) -> str:
+        _auth.validate_password(v)
+        return v
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str = Field(min_length=1)
+
+    @field_validator("email")
+    @classmethod
+    def _valid_email(cls, v: str) -> str:
+        return _auth.validate_email(v)
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str = Field(min_length=1)
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _strong_password(cls, v: str) -> str:
+        _auth.validate_password(v)
+        return v
+
+
+class AuthOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+class RefreshOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class SettingsOut(BaseModel):
+    company_name: str | None = None
+    country: str = "IN"
+    state: str | None = None
+    currency: str = "INR"
+    auto_approve_limit_inr: Decimal
+    tolerance_pct: Decimal
+    tolerance_flat_inr: Decimal
+    duplicate_window_days: int
+
+
+class SettingsIn(BaseModel):
+    company_name: str | None = None
+    country: str = "IN"
+    state: str | None = None
+    currency: str = "INR"
+    auto_approve_limit_inr: Decimal = Field(ge=0)
+    tolerance_pct: Decimal = Field(ge=0, le=100)
+    tolerance_flat_inr: Decimal = Field(ge=0)
+    duplicate_window_days: int = Field(ge=1, le=365)
+
+
+class VendorIn(BaseModel):
+    name: str = Field(min_length=1)
+    gstin: str | None = None
+    state: str | None = None
+    payment_terms: str | None = None
+    email: str | None = None
+
+    @field_validator("email")
+    @classmethod
+    def _valid_email_or_none(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        return _auth.validate_email(v)
+
+
+class VendorOut(BaseModel):
+    id: str
+    name: str
+    gstin: str | None = None
+    state: str | None = None
+    payment_terms: str | None = None
+    email: str | None = None
+
+
+class EvalSummaryOut(BaseModel):
+    synthetic: dict[str, Any] | None
+    graph: dict[str, Any] | None
+    generated_at: str
+    cached: bool
 
 
 class InvoiceOut(BaseModel):
@@ -25,6 +134,14 @@ class InvoiceOut(BaseModel):
     match: dict | None = None
     exceptions: list[dict] = Field(default_factory=list)
     payment_terms: str | None = None
+    # Last extraction failure, persisted by the pipeline. The UI keys
+    # its copy on extraction_error_kind — "no_key" only when the
+    # backend genuinely has no key configured; "overloaded" (503),
+    # "quota" (429) and "failed" carry the true reason in
+    # extraction_error. Both are None when extraction succeeded or
+    # has not run yet.
+    extraction_error: str | None = None
+    extraction_error_kind: str | None = None
 
 
 class DecisionIn(BaseModel):

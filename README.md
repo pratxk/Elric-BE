@@ -19,7 +19,7 @@ Health: `curl localhost:8000/health` → `{"status":"ok",...}`
 ## Tests
 
 ```bash
-pytest -q   # 74 tests; GEMINI_API_KEY is forcibly unset by tests/conftest.py
+pytest -q   # 177 tests; GEMINI_API_KEY is forcibly unset by tests/conftest.py
 ```
 
 Tests use an isolated SQLite file in /tmp (never the dev `elric.db`) and a
@@ -51,7 +51,98 @@ fresh store per test. Extraction is tested with a fake Gemini client only —
 | GET | `/api/forecast` | weekly outflows + discount recommendations (`?weeks=&weekly_budget_inr=&cost_of_capital_pct=`) |
 | POST | `/api/forecast/discount` | `{"invoice_id", "terms": "2/10 Net 30"}` → NPV pay-now/pay-later |
 | POST | `/api/eval/run` | synthetic-corpus matcher eval + end-to-end graph eval |
+| GET | `/api/eval/summary` | latest eval scores (cached) or a fresh run (`?refresh=true`) |
+| POST | `/api/auth/register` | `{email, password}` → 201 + session (public) |
+| POST | `/api/auth/login` | `{email, password}` → session (public; 5 failures → 15-min lockout) |
+| POST | `/api/auth/refresh` | rotates the refresh cookie → new access token (public) |
+| POST | `/api/auth/logout` | revokes the refresh token, clears the cookie (public) |
+| GET | `/api/auth/me` | current user (access token) |
+| POST | `/api/auth/complete-onboarding` | sets `onboarding_completed` (access token) |
+| POST | `/api/auth/change-password` | `{current_password, new_password}`; revokes ALL sessions |
+| GET | `/api/settings` | the user's settings (defaults created on first read) |
+| PUT | `/api/settings` | validated settings update |
+| POST | `/api/vendors` | create a vendor in the user's registry |
+| GET | `/api/vendors/{id}` | one registry vendor (404 cross-user) |
+| PUT | `/api/vendors/{id}` | update a registry vendor |
+| DELETE | `/api/vendors/{id}` | delete a registry vendor |
 | GET | `/health` | |
+
+## Auth + per-user scoping (v1.1)
+
+**Login: email + password.** Password policy (server-side, 422 on
+violation): 12–72 chars, at least one uppercase, one lowercase, one
+digit, one symbol. Hashing is **bcrypt, cost 12, via the `bcrypt`
+package directly** (passlib is unmaintained and breaks with bcrypt 4+;
+the raw package is the maintained path). Plaintext passwords are never
+stored, logged, or returned; hashes never appear in any API response.
+Login errors are generic — wrong password and unknown email both return
+401 `Invalid email or password`. Five failed logins lock the email out
+for 15 minutes (DB-backed `login_attempts`, survives restart); register
+with a duplicate email is a normal 409. No password reset in v1.1
+(that would need an email sender); change-password while logged in only.
+
+**Token contract (pinned):**
+- **Access token:** JWT, HS256, 15-minute expiry, returned in JSON as
+  `access_token`, sent as `Authorization: Bearer <token>`. Signed with
+  `JWT_SECRET` — the server **refuses to start** without it (no silent
+  fallback). Implemented on the standard library only
+  (`app/infra/jwt.py`); no PyJWT dependency.
+- **Refresh token:** opaque random token, 7-day expiry, stored
+  server-side only as a SHA-256 hash (`refresh_tokens` table: id,
+  user_id, token_hash, family_id, expires_at, revoked_at, created_at),
+  delivered in the HttpOnly `elric_refresh` cookie (SameSite=Lax,
+  Path=/, **Secure only when the request is HTTPS** — detected from the
+  request scheme, so localhost HTTP dev works and HTTPS deploys get the
+  flag).
+- **Rotation:** `POST /api/auth/refresh` (no body, reads the cookie)
+  revokes the presented token and issues a new one in the SAME
+  family_id, returning a fresh access token.
+- **Reuse detection:** presenting an already-rotated (revoked) or
+  expired token revokes the WHOLE family and returns 401, forcing
+  re-login. A completely unknown token hash revokes nothing (it may be
+  a stale cookie) — just 401.
+- **Logout** revokes the presented refresh token and clears the cookie.
+- **Change-password** revokes ALL of the user's refresh tokens (all
+  sessions, all devices) and returns `{"reauthenticate": true}` — the
+  client must discard its access token and redirect to `/login`
+  (access tokens are stateless JWTs and cannot be revoked server-side;
+  they expire within 15 minutes at most).
+- **Guard:** every `/api/*` endpoint except `/health`,
+  `POST /api/auth/register`, `POST /api/auth/login`, and
+  `POST /api/auth/refresh` requires a valid access token → 401.
+
+**Per-user scoping:** `users`, `settings` (one row per user), and the
+`vendors` registry are new tables; `user_id` (nullable) was added to
+invoices, purchase orders, goods receipts, ledger entries, payments,
+and the audit log. Every API read/write is scoped to the logged-in
+user; legacy rows with `user_id` NULL are invisible to everyone (the
+dev `elric.db`'s 2 legacy invoices are intentionally invisible now —
+not deleted). Cross-user access to a known id returns 404, never 403.
+
+**Settings flow into the pipeline:** the upload snapshots the owner's
+settings into graph state (`state["settings"]`); the matcher builds
+its `ToleranceConfig` (±pct / flat ₹), duplicate window, and the
+auto-approve policy from that snapshot (`policy_from_settings()` —
+used by BOTH the matcher node and the approver gate, so the two can
+never disagree). Env/config values are only the fallback for runs
+without settings (eval, graph tests). Settings: company_name, country
+(default IN), state, currency (default INR), auto_approve_limit_inr
+(default `AUTO_APPROVE_LIMIT_INR`), tolerance_pct (default 2.0),
+tolerance_flat_inr (default 500), duplicate_window_days (default 90).
+
+**Model (v1.1): `gemini-3.8-flash`.** `gemini-2.5-flash` is being
+retired and 404s intermittently; the code default (`app/config.py`)
+and `.env` / `.env.example` were switched on 2026-11-15. **Deploy
+note: set `GEMINI_MODEL=gemini-3.8-flash` in the Render env vars too**
+— `.env` is gitignored, so the deployed value does not follow the code.
+
+**Tax-default fix (v1.1, eval §4.2):** a missing per-line
+`tax_rate_pct` is now `None` (unknown), never defaulted to 18% Indian
+GST. The arithmetic self-check and the matcher's total rule skip their
+tax-dependent legs when any line rate is unknown (the subtotal leg
+still runs); GST validation likewise skips non-GST invoices instead of
+flagging them. See `tests/test_tax_default.py`, which re-checks the
+four saved benchmark extractions with zero new LLM calls.
 
 ## What works (v1, §16c)
 

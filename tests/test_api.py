@@ -6,8 +6,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.helpers import make_client
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _authed_client():
+    """Every test runs as a freshly registered user: the module-global
+    client is rebound to an authenticated TestClient (Bearer access
+    token as a default header) before each test."""
+    global client
+    client = make_client()
+    yield
 
 
 def test_health():
@@ -92,15 +103,19 @@ def test_metrics_endpoint():
 
 
 def _seed_aging_rows():
-    """Three open invoices: one overdue, one due soon, one current."""
+    """Three open invoices: one overdue, one due soon, one current.
+    Seeded as the test user's rows (user_id = the authed client user)
+    so the scoped endpoints can see them."""
     from datetime import date, timedelta
 
     from app.infra.store import store
 
     today = date.today()
+    uid = client.user_id
     store.create_invoice(
         {
             "id": "inv-overdue",
+            "user_id": uid,
             "vendor_id": "vendor-a",
             "vendor_name": "Vendor A",
             "invoice_number": "A-1",
@@ -113,6 +128,7 @@ def _seed_aging_rows():
     store.create_invoice(
         {
             "id": "inv-soon",
+            "user_id": uid,
             "vendor_id": "vendor-a",
             "vendor_name": "Vendor A",
             "invoice_number": "A-2",
@@ -125,6 +141,7 @@ def _seed_aging_rows():
     store.create_invoice(
         {
             "id": "inv-current",
+            "user_id": uid,
             "vendor_id": "vendor-b",
             "vendor_name": "Vendor B",
             "invoice_number": "B-1",

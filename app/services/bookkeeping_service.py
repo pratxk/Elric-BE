@@ -73,11 +73,14 @@ class BookkeepingService:
         }
 
     def post_invoice(
-        self, invoice: Invoice, payment_terms: str | None = None, store=None
+        self, invoice: Invoice, payment_terms: str | None = None, store=None,
+        user_id: str | None = None,
     ) -> dict:
         """Post to the ledger and schedule payment; persist when a store
         is given. Idempotent per invoice: an already-posted invoice is
-        not posted twice."""
+        not posted twice. Ledger/payment rows carry the owner's user_id
+        (v1.1 scoping); None keeps the legacy unscoped behaviour for
+        eval/graph runs without a user."""
         if store is not None and store.ledger_for_invoice(invoice.id):
             existing_payment = store.payments_for_invoice(invoice.id)
             return {
@@ -91,8 +94,8 @@ class BookkeepingService:
             }
         plan = self.plan_posting(invoice, payment_terms)
         if store is not None:
-            store.save_ledger_entries(plan["ledger_entries"])
-            store.save_payment(plan["payment"])
+            store.save_ledger_entries(plan["ledger_entries"], user_id=user_id)
+            store.save_payment(plan["payment"], user_id=user_id)
         plan["already_posted"] = False
         return plan
 
