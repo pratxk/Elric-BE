@@ -160,6 +160,10 @@ class MetricsOut(BaseModel):
     by_status: dict[str, int]
     exceptions_open: int
     money_in_exceptions_inr: Decimal
+    # Currency of money_in_exceptions_inr: the single currency of all
+    # exception invoices, else "INR" (INR subset only) — never a sum
+    # across currencies. Same rule for the overdue/due-soon totals.
+    money_in_exceptions_currency: str = "INR"
     auto_approved: int
     # Real numbers from the store / last eval run (0 / None when no data).
     match_rate: float = 0.0
@@ -168,11 +172,13 @@ class MetricsOut(BaseModel):
     median_cycle_time_seconds: float | None = None
     overdue_count: int = 0
     overdue_total_inr: Decimal = Decimal("0.00")
+    overdue_total_currency: str = "INR"
     # Full aging breakdown (buckets + due-soon) so the dashboard needs
     # no second call for the exceptions card.
     aging_buckets: dict[str, dict[str, Any]] = Field(default_factory=dict)
     due_soon_count: int = 0
     due_soon_total_inr: Decimal = Decimal("0.00")
+    due_soon_total_currency: str = "INR"
 
 
 class EvalRunOut(BaseModel):
@@ -186,6 +192,7 @@ class AgingOut(BaseModel):
     buckets: dict[str, dict[str, Any]]
     overdue_count: int
     overdue_total_inr: Decimal
+    overdue_total_currency: str = "INR"
     oldest_overdue_days: int
 
 

@@ -38,6 +38,7 @@ from langgraph.types import Command
 from app.agents.ingestor import document_hash
 from app.agents.matcher import _row_to_invoice
 from app.api.auth import require_user
+from app.domain.currency import single_currency_total
 from app.domain.lifecycle import transition
 from app.domain.models import (
     GoodsReceipt,
@@ -780,6 +781,7 @@ def aging(as_of: str | None = None, user: dict = Depends(require_user)):
         buckets=result["buckets"],
         overdue_count=result["overdue_count"],
         overdue_total_inr=Decimal(result["overdue_total_inr"]),
+        overdue_total_currency=result["overdue_total_currency"],
         oldest_overdue_days=result["oldest_overdue_days"],
     )
 
@@ -836,13 +838,13 @@ def vendor_summaries(user: dict = Depends(require_user)):
 def metrics(user: dict = Depends(require_user)):
     rows = store.list_invoices(user_id=user["id"])
     by_status: dict[str, int] = {}
-    money_in_exceptions = Decimal("0.00")
+    exception_amounts: list = []
     matched_clean = 0
     matched_total = 0
     for row in rows:
         by_status[row.status] = by_status.get(row.status, 0) + 1
         if row.status in (InvoiceStatus.FLAGGED.value, InvoiceStatus.ON_HOLD.value):
-            money_in_exceptions += Decimal(str(row.total))
+            exception_amounts.append((row.currency, row.total))
         if row.match_json:
             matched_total += 1
             match = json.loads(row.match_json)
@@ -860,6 +862,9 @@ def metrics(user: dict = Depends(require_user)):
             end = entries[-1].created_at
             cycle_seconds.append((end - start).total_seconds())
     aging_result = compute_aging(rows)
+    money_in_exceptions, exceptions_currency = single_currency_total(
+        exception_amounts
+    )
     latest_eval = store.latest_eval_run("synthetic")
     false_rate = None
     if latest_eval is not None:
@@ -869,6 +874,7 @@ def metrics(user: dict = Depends(require_user)):
         by_status=by_status,
         exceptions_open=by_status.get("flagged", 0) + by_status.get("on_hold", 0),
         money_in_exceptions_inr=money_in_exceptions,
+        money_in_exceptions_currency=exceptions_currency,
         auto_approved=auto_approved,
         match_rate=matched_clean / matched_total if matched_total else 0.0,
         auto_approve_rate=auto_approved / len(rows) if rows else 0.0,
@@ -878,9 +884,11 @@ def metrics(user: dict = Depends(require_user)):
         ),
         overdue_count=aging_result["overdue_count"],
         overdue_total_inr=Decimal(aging_result["overdue_total_inr"]),
+        overdue_total_currency=aging_result["overdue_total_currency"],
         aging_buckets=aging_result["buckets"],
         due_soon_count=aging_result["due_soon_count"],
         due_soon_total_inr=Decimal(aging_result["due_soon_total_inr"]),
+        due_soon_total_currency=aging_result["due_soon_total_currency"],
     )
 
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from decimal import Decimal
 
+from app.domain.currency import single_currency_total
+
 BUCKETS = ("current", "overdue_1_30", "overdue_31_60", "overdue_61_90", "overdue_90_plus")
 
 # "Due soon": an open invoice whose due date falls within this many days.
@@ -45,6 +47,10 @@ def compute_aging(invoices: list, as_of: date | None = None) -> dict:
         b: {"count": 0, "total_inr": Decimal("0.00")} for b in BUCKETS
     }
     oldest_overdue_days = 0
+    # Per-currency totals for the displayed aggregates: money is never
+    # summed across currencies (no FX in the demo). Bucket "total_inr"
+    # values below are still raw sums and are NOT displayed as money.
+    overdue_amounts: list = []
     for inv in invoices:
         status = inv.get("status") if isinstance(inv, dict) else getattr(inv, "status", None)
         if status is not None and status not in open_statuses:
@@ -56,15 +62,19 @@ def compute_aging(invoices: list, as_of: date | None = None) -> dict:
         bucket = bucket_for(due, as_of)
         buckets[bucket]["count"] += 1
         buckets[bucket]["total_inr"] += Decimal(str(total))
+        if bucket in BUCKETS[1:]:
+            currency = (
+                inv.get("currency") if isinstance(inv, dict)
+                else getattr(inv, "currency", None)
+            )
+            overdue_amounts.append((currency, total))
         if due is not None:
             oldest_overdue_days = max(oldest_overdue_days, (as_of - due).days)
     overdue_count = sum(buckets[b]["count"] for b in BUCKETS[1:])
-    overdue_total = sum(
-        (buckets[b]["total_inr"] for b in BUCKETS[1:]), Decimal("0.00")
-    )
+    overdue_total, overdue_currency = single_currency_total(overdue_amounts)
     # Due soon: open invoices due within DUE_SOON_DAYS (not yet overdue).
     due_soon_count = 0
-    due_soon_total = Decimal("0.00")
+    due_soon_amounts: list = []
     for inv in invoices:
         status = inv.get("status") if isinstance(inv, dict) else getattr(inv, "status", None)
         if status is not None and status not in open_statuses:
@@ -77,7 +87,12 @@ def compute_aging(invoices: list, as_of: date | None = None) -> dict:
         if 0 < (due - as_of).days <= DUE_SOON_DAYS:
             due_soon_count += 1
             total = inv.get("total", 0) if isinstance(inv, dict) else getattr(inv, "total", 0)
-            due_soon_total += Decimal(str(total))
+            currency = (
+                inv.get("currency") if isinstance(inv, dict)
+                else getattr(inv, "currency", None)
+            )
+            due_soon_amounts.append((currency, total))
+    due_soon_total, due_soon_currency = single_currency_total(due_soon_amounts)
     return {
         "as_of": str(as_of),
         "buckets": {
@@ -86,7 +101,9 @@ def compute_aging(invoices: list, as_of: date | None = None) -> dict:
         },
         "overdue_count": overdue_count,
         "overdue_total_inr": str(overdue_total),
+        "overdue_total_currency": overdue_currency,
         "oldest_overdue_days": oldest_overdue_days,
         "due_soon_count": due_soon_count,
         "due_soon_total_inr": str(due_soon_total),
+        "due_soon_total_currency": due_soon_currency,
     }
