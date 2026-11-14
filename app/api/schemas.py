@@ -51,6 +51,11 @@ class MetricsOut(BaseModel):
     median_cycle_time_seconds: float | None = None
     overdue_count: int = 0
     overdue_total_inr: Decimal = Decimal("0.00")
+    # Full aging breakdown (buckets + due-soon) so the dashboard needs
+    # no second call for the exceptions card.
+    aging_buckets: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    due_soon_count: int = 0
+    due_soon_total_inr: Decimal = Decimal("0.00")
 
 
 class EvalRunOut(BaseModel):

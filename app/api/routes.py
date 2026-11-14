@@ -577,6 +577,53 @@ def aging(as_of: str | None = None):
     )
 
 
+@router.get("/vendors")
+def vendor_summaries():
+    """Per-vendor open AP position, derived from stored invoices.
+
+    Open balance = open (unpaid) invoice totals per vendor; open count
+    and last invoice date likewise. Reliability / on-time scores are
+    deliberately NOT returned — no history exists to ground them.
+    """
+    open_statuses = {
+        "received", "extracted", "validated", "matched", "flagged",
+        "approved", "posted", "scheduled", "on_hold",
+    }
+    by_vendor: dict[str, dict] = {}
+    for row in store.list_invoices():
+        if row.status not in open_statuses:
+            continue
+        # Rows with no vendor at all (e.g. an upload that never
+        # extracted) have no vendor to attribute the balance to.
+        if not row.vendor_id and not row.vendor_name:
+            continue
+        entry = by_vendor.setdefault(
+            row.vendor_id,
+            {
+                "vendor_id": row.vendor_id,
+                "vendor_name": row.vendor_name or row.vendor_id,
+                "open_balance_inr": Decimal("0.00"),
+                "open_count": 0,
+                "last_invoice_date": None,
+            },
+        )
+        entry["open_balance_inr"] += Decimal(str(row.total))
+        entry["open_count"] += 1
+        if row.invoice_date and (
+            entry["last_invoice_date"] is None
+            or row.invoice_date > entry["last_invoice_date"]
+        ):
+            entry["last_invoice_date"] = row.invoice_date
+    summaries = sorted(
+        by_vendor.values(),
+        key=lambda e: e["open_balance_inr"],
+        reverse=True,
+    )
+    for entry in summaries:
+        entry["open_balance_inr"] = str(entry["open_balance_inr"])
+    return summaries
+
+
 @router.get("/metrics", response_model=MetricsOut)
 def metrics():
     rows = store.list_invoices()
@@ -623,6 +670,9 @@ def metrics():
         ),
         overdue_count=aging_result["overdue_count"],
         overdue_total_inr=Decimal(aging_result["overdue_total_inr"]),
+        aging_buckets=aging_result["buckets"],
+        due_soon_count=aging_result["due_soon_count"],
+        due_soon_total_inr=Decimal(aging_result["due_soon_total_inr"]),
     )
 
 

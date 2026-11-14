@@ -91,6 +91,95 @@ def test_metrics_endpoint():
     assert "money_in_exceptions_inr" in body
 
 
+def _seed_aging_rows():
+    """Three open invoices: one overdue, one due soon, one current."""
+    from datetime import date, timedelta
+
+    from app.infra.store import store
+
+    today = date.today()
+    store.create_invoice(
+        {
+            "id": "inv-overdue",
+            "vendor_id": "vendor-a",
+            "vendor_name": "Vendor A",
+            "invoice_number": "A-1",
+            "invoice_date": str(today),
+            "due_date": str(today - timedelta(days=10)),
+            "status": "flagged",
+            "total": "2000",
+        }
+    )
+    store.create_invoice(
+        {
+            "id": "inv-soon",
+            "vendor_id": "vendor-a",
+            "vendor_name": "Vendor A",
+            "invoice_number": "A-2",
+            "invoice_date": str(today),
+            "due_date": str(today + timedelta(days=3)),
+            "status": "matched",
+            "total": "3000",
+        }
+    )
+    store.create_invoice(
+        {
+            "id": "inv-current",
+            "vendor_id": "vendor-b",
+            "vendor_name": "Vendor B",
+            "invoice_number": "B-1",
+            "invoice_date": str(today),
+            "due_date": str(today + timedelta(days=30)),
+            "status": "received",
+            "total": "4000",
+        }
+    )
+
+
+def test_metrics_serves_aging_breakdown_and_due_soon():
+    _seed_aging_rows()
+    resp = client.get("/api/metrics")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["overdue_count"] == 1
+    assert body["due_soon_count"] == 1
+    assert body["aging_buckets"]["overdue_1_30"]["count"] == 1
+    assert body["aging_buckets"]["current"]["count"] == 2
+
+
+def test_vendors_endpoint_sums_open_balances():
+    _seed_aging_rows()
+    resp = client.get("/api/vendors")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 2
+    assert body[0]["vendor_id"] == "vendor-a"
+    assert body[0]["open_balance_inr"] == "5000.00"
+    assert body[0]["open_count"] == 2
+    assert body[1]["vendor_id"] == "vendor-b"
+    assert body[1]["open_balance_inr"] == "4000.00"
+    assert body[1]["open_count"] == 1
+
+
+def test_vendors_endpoint_skips_invoices_with_no_vendor():
+    from app.infra.store import store
+
+    store.create_invoice(
+        {
+            "id": "inv-no-vendor",
+            "vendor_id": "",
+            "vendor_name": "",
+            "invoice_number": "no-key.pdf",
+            "invoice_date": "",
+            "status": "on_hold",
+            "total": "0",
+        }
+    )
+    resp = client.get("/api/vendors")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
 def test_exception_queue_endpoint():
     resp = client.get("/api/queue/exceptions")
     assert resp.status_code == 200

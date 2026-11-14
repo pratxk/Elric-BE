@@ -203,6 +203,21 @@ def test_aging_buckets():
     assert result["oldest_overdue_days"] == 106
 
 
+def test_aging_due_soon():
+    as_of = date(2026, 11, 15)
+    invoices = [
+        _aging_invoice(date(2026, 11, 18), "1000"),  # due in 3 days
+        _aging_invoice(date(2026, 11, 22), "2000"),  # due in 7 days (boundary)
+        _aging_invoice(date(2026, 11, 23), "3000"),  # due in 8 days — not soon
+        _aging_invoice(date(2026, 11, 15), "4000"),  # due today — current, not soon
+        _aging_invoice(date(2026, 11, 14), "5000"),  # overdue — not soon
+        _aging_invoice(date(2026, 11, 20), "6000", status="paid"),  # excluded
+    ]
+    result = compute_aging(invoices, as_of=as_of)
+    assert result["due_soon_count"] == 2
+    assert result["due_soon_total_inr"] == "3000.00"
+
+
 # -- forecast --------------------------------------------------------------
 
 

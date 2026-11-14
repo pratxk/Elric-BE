@@ -55,7 +55,10 @@ INVOICE_EXTRACTION_SCHEMA: dict = {
         "igst": {"type": "number"},
         "field_confidences": {
             "type": "object",
-            "additionalProperties": {"type": "number"},
+            "description": (
+                "Per-field confidence 0..1, keyed by field name "
+                "(e.g. vendor_name, total). Free-form keys."
+            ),
         },
     },
     "required": ["vendor_name", "invoice_number", "invoice_date", "lines", "total"],

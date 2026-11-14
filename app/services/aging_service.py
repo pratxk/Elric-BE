@@ -7,10 +7,13 @@ carries a count and a total. Overdue alerts surface in metrics.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 BUCKETS = ("current", "overdue_1_30", "overdue_31_60", "overdue_61_90", "overdue_90_plus")
+
+# "Due soon": an open invoice whose due date falls within this many days.
+DUE_SOON_DAYS = 7
 
 
 def bucket_for(due: date | None, as_of: date) -> str:
@@ -59,6 +62,22 @@ def compute_aging(invoices: list, as_of: date | None = None) -> dict:
     overdue_total = sum(
         (buckets[b]["total_inr"] for b in BUCKETS[1:]), Decimal("0.00")
     )
+    # Due soon: open invoices due within DUE_SOON_DAYS (not yet overdue).
+    due_soon_count = 0
+    due_soon_total = Decimal("0.00")
+    for inv in invoices:
+        status = inv.get("status") if isinstance(inv, dict) else getattr(inv, "status", None)
+        if status is not None and status not in open_statuses:
+            continue
+        due = inv.get("due_date") if isinstance(inv, dict) else getattr(inv, "due_date", None)
+        if isinstance(due, str):
+            due = date.fromisoformat(due) if due else None
+        if due is None:
+            continue
+        if 0 < (due - as_of).days <= DUE_SOON_DAYS:
+            due_soon_count += 1
+            total = inv.get("total", 0) if isinstance(inv, dict) else getattr(inv, "total", 0)
+            due_soon_total += Decimal(str(total))
     return {
         "as_of": str(as_of),
         "buckets": {
@@ -68,4 +87,6 @@ def compute_aging(invoices: list, as_of: date | None = None) -> dict:
         "overdue_count": overdue_count,
         "overdue_total_inr": str(overdue_total),
         "oldest_overdue_days": oldest_overdue_days,
+        "due_soon_count": due_soon_count,
+        "due_soon_total_inr": str(due_soon_total),
     }
