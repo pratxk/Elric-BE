@@ -1,0 +1,1 @@
+"""Matching strategies — pure Python."""

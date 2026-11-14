@@ -1,0 +1,14 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.db-journal
+.git/
+.github/
+tests/
+README.md
+Dockerfile
+.dockerignore
