@@ -13,6 +13,12 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "sqlalchemy>=2.0",
+    # Postgres driver (binary wheels bundle libpq — the slim image has
+    # no system libpq). Required once DATABASE_URL points at Neon;
+    # without it the app fails to boot (psycopg itself is only a
+    # transitive dep of langgraph-checkpoint-postgres, with no pq
+    # wrapper). The URL must use the postgresql+psycopg:// scheme.
+    "psycopg[binary]>=3.2",
     "langgraph>=0.6",
     "langgraph-checkpoint-postgres>=2.0",
     "httpx>=0.27",
